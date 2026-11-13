@@ -1,23 +1,32 @@
-# VS Code language model backend harness
+# VS Code language model provider runtime harness
 
-This project provides an offline-by-default pytest conformance suite for Python
-backends that are adapted to VS Code's Language Model Chat Provider API. It
-checks model discovery, model metadata, token counting, streamed response
-parts, cancellation, and declared image/tool capabilities.
+This harness tests a Python language-model backend through a real VS Code
+Extension Development Host. It does not mock `vscode.lm`: the test extension
+registers a `LanguageModelChatProvider`, then the VS Code host discovers the
+provider, selects its model, counts tokens, streams a chat response, and sends a
+cancellation token. A local Python bridge forwards those VS Code requests to
+the configured backend.
 
-The harness tests the Python backend boundary, not the VS Code extension
-runtime. A VS Code extension still needs to register a
-`LanguageModelChatProvider` and translate between the VS Code API types and the
-contracts in `vscode_llm_harness`. See the
-[official provider guide](https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider)
-for registration and extension-side details.
+The checks are driven by pytest, but pass only when the actual VS Code runtime
+starts and the in-host integration checks succeed. Pytest reports model
+discovery, token counting, chat streaming, and cancellation as separate cases;
+each case starts an isolated Extension Development Host.
+See the [VS Code provider API guide](https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider)
+for the upstream extension contract.
 
 ## Requirements
 
 - Python 3.10+
 - pytest 8+
+- VS Code 1.104 or later, installed locally
 
-## Run the included example
+The harness uses the installed VS Code CLI, so it does not download a separate
+editor build. By default it checks `code` on `PATH`, then the usual Windows
+install locations. Set `VSCODE_EXECUTABLE` if VS Code is installed elsewhere.
+Each run uses isolated VS Code user-data and extension directories; it does not
+modify the user's normal VS Code profile.
+
+## Run the runtime tests
 
 ```powershell
 py -m venv .venv
@@ -26,48 +35,63 @@ python -m pip install -e ".[test]"
 python -m pytest
 ```
 
-The example backend is deterministic and requires no API key or network access.
+The included echo backend is offline and deterministic. It streams several
+chunks with a delay so the runtime cancellation test can verify that the
+backend was still active when VS Code cancelled the request.
 
 ## Test your backend
 
 Implement a factory that returns an object matching the `Backend` protocol in
-`vscode_llm_harness/contracts.py`. The backend exposes:
+`vscode_llm_harness/contracts.py`:
 
-- `async list_models(*, silent: bool, cancellation: asyncio.Event)` returning
-  `ModelInfo` objects. Silent discovery must not prompt for credentials or
-  configuration.
-- `stream_chat(model, messages, options, cancellation)`, an async iterator of
-  response parts. It should stop promptly after the supplied
-  `asyncio.Event` is set.
-- `async count_tokens(model, text, cancellation)` accepting either a string or
-  a `RequestMessage`.
+- `async list_models(*, silent, cancellation)` returns `ModelInfo` instances.
+- `stream_chat(model, messages, options, cancellation)` returns an async
+  iterator of `ResponseText`, `ResponseToolCall`, and/or `ResponseToolResult`.
+- `async count_tokens(model, text, cancellation)` accepts a string or
+  `RequestMessage`.
 
-The contract types preserve the main VS Code provider concepts: model metadata
-and capabilities, text/image/tool request content, streamed text/tool response
-parts, token counting, and cancellation. Your extension adapter is responsible
-for mapping VS Code's API types and cancellation token to these Python types.
+The cancellation argument is an `asyncio.Event`. The runtime adapter forwards
+VS Code's cancellation token to this event and stops consuming the stream when
+it is set.
 
-Make your backend importable in the active Python environment, then point the
-suite at its zero-argument factory:
+Make the backend importable from the project directory, then run:
 
 ```powershell
 $env:VSCODE_LLM_BACKEND = "my_backend:create_backend"
-pytest
+python -m pytest
 ```
 
-Use an import path that Python can resolve from the project directory (for
-example, install your backend package in the active environment or add its
-source root to `PYTHONPATH`). If no environment variable is set, pytest tests
-the included echo backend.
+Optionally point to a different VS Code installation or increase the startup
+timeout:
 
-Models declaring image input or tool calling are exercised with corresponding
-requests. Models that do not declare a capability are skipped for that
-capability-specific check. Network-backed implementations should use a
-dedicated test account or a local test endpoint; the general chat conformance
-tests issue real requests to every discovered model.
+```powershell
+$env:VSCODE_EXECUTABLE = "C:\Program Files\Microsoft VS Code\Code.exe"
+$env:VSCODE_LLM_RUNTIME_TIMEOUT = "240"
+python -m pytest
+```
 
-## Test report
+`VSCODE_EXECUTABLE` may point to the VS Code CLI (`code.cmd` on Windows), or
+to `Code.exe` in its standard installation layout.
 
-The suite skips model-dependent checks when silent discovery returns no models.
-Such a run is not evidence that chat, token counting, or cancellation works;
-configure the backend to expose at least one test model for those checks.
+The backend factory remains inside pytest. VS Code and pytest exchange bridge
+requests through a private temporary directory, avoiding network ports and
+keeping model credentials and backend traffic on the local machine.
+
+## What is exercised
+
+The extension-host checks cover:
+
+- Provider activation and model discovery through `vscode.lm.selectChatModels`
+- Public model metadata as observed by VS Code
+- Token counting through VS Code's chat-model API
+- Chat request and streamed text response through VS Code
+- Cancellation reaching the backend while a response is still active
+
+This verifies the backend through VS Code's provider runtime, not Copilot's own
+models or service. It does not prove that VS Code UI policy, Copilot account
+configuration, vendor publishing, or every third-party service integration is
+available to end users. VS Code's selected-model API does not expose all
+provider metadata (including output-token limits and optional capabilities).
+Image and tool-call content is translated by the adapter, but
+capability-specific image/tool round trips are not exercised by the current
+integration suite.

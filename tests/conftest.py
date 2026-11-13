@@ -1,11 +1,13 @@
-import asyncio
 import importlib
 import os
 from collections.abc import Callable
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
 from vscode_llm_harness import Backend
+from vscode_llm_harness.bridge import BackendBridge, FileBridge
 
 
 def _load_backend(specification: str) -> Backend:
@@ -30,7 +32,9 @@ def _load_backend(specification: str) -> Backend:
 
     backend = factory()
     required_methods = ("list_models", "stream_chat", "count_tokens")
-    missing = [name for name in required_methods if not callable(getattr(backend, name, None))]
+    missing = [
+        name for name in required_methods if not callable(getattr(backend, name, None))
+    ]
     if missing:
         raise pytest.UsageError(
             f"Backend is missing required methods: {', '.join(missing)}"
@@ -39,30 +43,16 @@ def _load_backend(specification: str) -> Backend:
 
 
 @pytest.fixture(scope="session")
-def backend() -> Backend:
+def vscode_bridge():
     specification = os.environ.get(
         "VSCODE_LLM_BACKEND", "examples.echo_backend:create_backend"
     )
-    return _load_backend(specification)
-
-
-@pytest.fixture(scope="session")
-def harness_loop():
-    loop = asyncio.new_event_loop()
-    try:
-        yield loop
-    finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-
-
-@pytest.fixture(scope="session")
-def run_async(harness_loop):
-    return harness_loop.run_until_complete
-
-
-@pytest.fixture(scope="session")
-def models(backend: Backend, run_async):
-    return run_async(
-        backend.list_models(silent=True, cancellation=asyncio.Event())
-    )
+    with TemporaryDirectory(prefix="vscode-llm-bridge-") as directory:
+        bridge = FileBridge(
+            BackendBridge(_load_backend(specification)), Path(directory)
+        )
+        bridge.start()
+        try:
+            yield {"directory": directory, "bridge": bridge}
+        finally:
+            bridge.close()

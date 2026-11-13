@@ -48,11 +48,13 @@ class EchoBackend:
             for part in message.content
             if isinstance(part, TextContent)
         )
-        if prompt and not cancellation.is_set():
+        for offset in range(0, len(prompt), 5):
+            if cancellation.is_set():
+                return
             try:
-                await asyncio.wait_for(cancellation.wait(), timeout=0.1)
+                await asyncio.wait_for(cancellation.wait(), timeout=0.05)
             except asyncio.TimeoutError:
-                yield ResponseText(prompt)
+                yield ResponseText(prompt[offset : offset + 5])
 
     def stream_chat(
         self,

@@ -1,0 +1,23 @@
+{
+  "name": "vscode-llm-provider-harness-runtime",
+  "displayName": "VS Code LLM Provider Harness Runtime",
+  "description": "Development-host integration test adapter for custom language model backends.",
+  "version": "0.1.0",
+  "publisher": "local-harness",
+  "engines": {
+    "vscode": "^1.104.0"
+  },
+  "categories": [
+    "AI"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "pytest-harness",
+        "displayName": "Pytest Harness Backend"
+      }
+    ]
+  }
+}
