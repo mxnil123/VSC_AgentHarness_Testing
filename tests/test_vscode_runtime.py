@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import shutil
@@ -45,13 +46,37 @@ def _find_vscode() -> str:
 
 @pytest.mark.parametrize(
     "runtime_check",
-    ["discovery", "token_count", "chat", "cancellation"],
-    ids=["model-discovery", "token-counting", "chat-streaming", "cancellation"],
+    [
+        "discovery",
+        "token_count",
+        "chat",
+        "model_options",
+        "image_input",
+        "tool_calling",
+        "response_parts",
+        "cancellation",
+        "backend_error",
+        "empty_discovery",
+    ],
+    ids=[
+        "model-discovery",
+        "token-counting",
+        "chat-streaming",
+        "model-options",
+        "image-input",
+        "tool-calling",
+        "response-parts",
+        "cancellation",
+        "backend-error-propagation",
+        "empty-model-discovery",
+    ],
 )
 def test_custom_backend_through_real_vscode_extension_host(
     vscode_bridge, runtime_check
 ):
     executable = _find_vscode()
+    if runtime_check == "empty_discovery":
+        vscode_bridge["test_backend"].empty_model_list = True
     with tempfile.TemporaryDirectory(
         prefix="vscode-llm-runtime-", ignore_cleanup_errors=True
     ) as temp_dir:
@@ -114,7 +139,10 @@ def test_custom_backend_through_real_vscode_extension_host(
         ]
         bridge_stats = vscode_bridge["bridge"].cancel_stats()
         models = vscode_bridge["bridge"].model_info()
-        assert models, "VS Code discovery did not populate backend model metadata."
+        if runtime_check == "empty_discovery":
+            assert not models, "The empty backend discovery unexpectedly returned models."
+        else:
+            assert models, "VS Code discovery did not populate backend model metadata."
         model_ids = [model.id for model in models]
         assert len(model_ids) == len(set(model_ids)), (
             "The provider returned duplicate model IDs."
@@ -150,3 +178,85 @@ def test_custom_backend_through_real_vscode_extension_host(
             item["name"] == runtime_check and item["passed"]
             for item in test_results
         ), f"The requested runtime check {runtime_check!r} did not pass."
+        assert vscode_bridge["bridge"].discovery_options(), (
+            "The VS Code host did not pass model-discovery options to the backend."
+        )
+        if runtime_check == "token_count":
+            inputs = vscode_bridge["bridge"].token_count_history()
+            assert len(inputs) >= len(models) * 2
+            for model in models:
+                model_inputs = [
+                    value for model_id, value in inputs if model_id == model.id
+                ]
+                assert any(isinstance(value, str) for value in model_inputs)
+                assert any(
+                    not isinstance(value, str) for value in model_inputs
+                )
+        elif runtime_check == "chat":
+            invocations = vscode_bridge["bridge"].chat_history()
+            assert {item.model_id for item in invocations} == set(model_ids)
+        elif runtime_check == "model_options":
+            invocation = vscode_bridge["bridge"].chat_history()[-1]
+            assert invocation.options.max_output_tokens == 19
+            assert invocation.options.temperature == 0.125
+            assert invocation.options.model_options == {
+                "maxOutputTokens": 19,
+                "temperature": 0.125,
+                "harnessProbe": "preserved",
+            }
+        elif runtime_check in ("image_input", "tool_calling"):
+            check_result = next(
+                item for item in test_results if item["name"] == runtime_check
+            )
+            if check_result.get("skipped"):
+                pytest.skip(check_result.get("reason", "No optional capabilities."))
+            invocations = vscode_bridge["bridge"].chat_history()
+            if runtime_check == "image_input":
+                from vscode_llm_harness import ImageContent
+
+                image_inputs = [
+                    part
+                    for item in invocations
+                    for message in item.messages
+                    for part in message.content
+                    if isinstance(part, ImageContent)
+                ]
+                assert len(image_inputs) == 1
+                assert image_inputs[0].media_type == "image/png"
+                assert image_inputs[0].data == base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l3sAAAAASUVORK5CYII="
+                )
+            else:
+                from vscode_llm_harness import (
+                    JsonContent,
+                    ToolCallContent,
+                    ToolResultContent,
+                )
+
+                tool_invocations = [item for item in invocations if item.options.tools]
+                assert tool_invocations
+                assert tool_invocations[0].options.tool_choice == 2
+                assert tool_invocations[0].options.tools[0].name == "lookup_value"
+                assert any(
+                    isinstance(part, ToolCallContent)
+                    for item in invocations
+                    for message in item.messages
+                    for part in message.content
+                )
+                assert any(
+                    isinstance(part, ToolResultContent)
+                    for item in invocations
+                    for message in item.messages
+                    for part in message.content
+                )
+                assert any(
+                    isinstance(content, JsonContent)
+                    for item in invocations
+                    for message in item.messages
+                    for part in message.content
+                    if isinstance(part, ToolResultContent)
+                    and not isinstance(part.content, str)
+                    for content in part.content
+                )
+        elif runtime_check == "response_parts":
+            assert len(vscode_bridge["bridge"].chat_history()) >= 2

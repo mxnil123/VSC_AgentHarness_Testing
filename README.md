@@ -9,8 +9,9 @@ the configured backend.
 
 The checks are driven by pytest, but pass only when the actual VS Code runtime
 starts and the in-host integration checks succeed. Pytest reports model
-discovery, token counting, chat streaming, and cancellation as separate cases;
-each case starts an isolated Extension Development Host.
+discovery, token counting, chat streaming, model options, multimodal/tool use,
+response-part conversion, cancellation, and backend error propagation as
+separate cases; each case starts an isolated Extension Development Host.
 See the [VS Code provider API guide](https://code.visualstudio.com/api/extension-guides/ai/language-model-chat-provider)
 for the upstream extension contract.
 
@@ -46,9 +47,15 @@ Implement a factory that returns an object matching the `Backend` protocol in
 
 - `async list_models(*, silent, cancellation)` returns `ModelInfo` instances.
 - `stream_chat(model, messages, options, cancellation)` returns an async
-  iterator of `ResponseText`, `ResponseToolCall`, and/or `ResponseToolResult`.
+  iterator of `ResponseText`, `ResponseToolCall`, `ResponseToolResult`, and/or
+  `ResponseData`.
 - `async count_tokens(model, text, cancellation)` accepts a string or
   `RequestMessage`.
+
+Request messages can contain text, image/data, tool-call, and tool-result
+parts. `ChatOptions` carries tool definitions, tool mode, common generation
+settings, and provider-specific `model_options`. Model metadata includes
+image-input and tool-calling capabilities.
 
 The cancellation argument is an `asyncio.Event`. The runtime adapter forwards
 VS Code's cancellation token to this event and stops consuming the stream when
@@ -81,17 +88,25 @@ keeping model credentials and backend traffic on the local machine.
 
 The extension-host checks cover:
 
-- Provider activation and model discovery through `vscode.lm.selectChatModels`
-- Public model metadata as observed by VS Code
-- Token counting through VS Code's chat-model API
-- Chat request and streamed text response through VS Code
+- Provider activation, multiple model discovery, unique IDs, filtered
+  selection by ID/family/version, no-match and empty-list selection, and model
+  metadata through VS Code
+- Token counting for both strings and `LanguageModelChatMessage` instances
+- Chat request and streamed text response for every discovered model
+- Forwarding of custom `modelOptions`, tool definitions, and required tool mode
+- Image input and tool-call/tool-result message round trips when the backend
+  advertises those capabilities (otherwise pytest marks the case skipped)
+- Data and tool-result response-part conversion through the real VS Code host
 - Cancellation reaching the backend while a response is still active
+- Backend error propagation to VS Code and successful requests after an error
 
 This verifies the backend through VS Code's provider runtime, not Copilot's own
 models or service. It does not prove that VS Code UI policy, Copilot account
 configuration, vendor publishing, or every third-party service integration is
 available to end users. VS Code's selected-model API does not expose all
-provider metadata (including output-token limits and optional capabilities).
-Image and tool-call content is translated by the adapter, but
-capability-specific image/tool round trips are not exercised by the current
-integration suite.
+provider metadata, so those fields are checked against the provider metadata
+returned by the extension itself. The response-part and error-path cases use
+exact test-only sentinel messages intercepted by a transparent pytest backend
+wrapper, and the empty-discovery case configures that wrapper to return no
+models. Those cases validate the adapter/runtime path rather than model
+quality. All other requests are delegated to the configured backend.

@@ -4,6 +4,7 @@ import json
 import os
 import threading
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,10 @@ from .contracts import (
     Backend,
     ChatOptions,
     ImageContent,
+    JsonContent,
     ModelInfo,
     RequestMessage,
+    ResponseData,
     ResponseText,
     ResponseToolCall,
     ResponseToolResult,
@@ -26,15 +29,39 @@ from .contracts import (
 _END = object()
 
 
+@dataclass(frozen=True)
+class ChatInvocation:
+    model_id: str
+    messages: tuple[RequestMessage, ...]
+    options: ChatOptions
+
+
+def _read_result_content(
+    value: object,
+) -> str | tuple[TextContent | ImageContent | JsonContent, ...]:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        raise ValueError("Tool result content must be a string or an array.")
+    parts = tuple(_read_content(part) for part in value)
+    if not all(
+        isinstance(part, (TextContent, ImageContent, JsonContent)) for part in parts
+    ):
+        raise ValueError("Tool result content contains an unsupported content part.")
+    return parts
+
+
 def _read_content(part: Mapping[str, Any]):
     kind = part.get("type")
     if kind == "text":
         return TextContent(str(part.get("value", "")))
-    if kind == "image":
+    if kind in ("image", "data"):
         return ImageContent(
             media_type=str(part["media_type"]),
             data=base64.b64decode(part["data"], validate=True),
         )
+    if kind == "json":
+        return JsonContent(value=part.get("value"))
     if kind == "tool_call":
         arguments = part.get("arguments", {})
         if not isinstance(arguments, Mapping):
@@ -47,7 +74,7 @@ def _read_content(part: Mapping[str, Any]):
     if kind == "tool_result":
         return ToolResultContent(
             call_id=str(part["call_id"]),
-            content=str(part.get("content", "")),
+            content=_read_result_content(part.get("content", "")),
         )
     raise ValueError(f"Unsupported request content type: {kind!r}")
 
@@ -94,12 +121,35 @@ def _response_to_json(part: object) -> dict[str, Any]:
             "arguments": dict(part.arguments),
         }
     if isinstance(part, ResponseToolResult):
+        content = part.content
+        if not isinstance(content, str):
+            content = [_content_to_json(item) for item in content]
         return {
             "type": "tool_result",
             "call_id": part.call_id,
-            "content": part.content,
+            "content": content,
+        }
+    if isinstance(part, ResponseData):
+        return {
+            "type": "data",
+            "media_type": part.media_type,
+            "data": base64.b64encode(part.data).decode("ascii"),
         }
     raise TypeError(f"Unsupported backend response part: {type(part).__name__}")
+
+
+def _content_to_json(
+    part: TextContent | ImageContent | JsonContent,
+) -> dict[str, Any]:
+    if isinstance(part, TextContent):
+        return {"type": "text", "value": part.value}
+    if isinstance(part, JsonContent):
+        return {"type": "json", "value": part.value}
+    return {
+        "type": "image",
+        "media_type": part.media_type,
+        "data": base64.b64encode(part.data).decode("ascii"),
+    }
 
 
 async def _next_or_cancel(iterator, cancellation: asyncio.Event):
@@ -133,6 +183,9 @@ class BackendBridge:
         self._cancel_requests = 0
         self._active_cancel_requests = 0
         self._model_discovery_requests = 0
+        self._discovery_options: list[bool] = []
+        self._token_count_history: list[tuple[str, str | RequestMessage]] = []
+        self._chat_history: list[ChatInvocation] = []
         self._loop_thread.start()
 
     def _run_loop(self) -> None:
@@ -154,6 +207,7 @@ class BackendBridge:
     def list_models(self, silent: bool) -> list[dict[str, Any]]:
         with self._lock:
             self._model_discovery_requests += 1
+            self._discovery_options.append(silent)
         cancellation = self._run(self._new_event())
         models = self._run(
             self.backend.list_models(silent=silent, cancellation=cancellation)
@@ -169,6 +223,8 @@ class BackendBridge:
             raise ValueError(f"Unknown model ID: {payload.get('model_id')!r}")
         value = payload.get("text")
         text = _read_message(value) if isinstance(value, Mapping) else str(value)
+        with self._lock:
+            self._token_count_history.append((model.id, text))
         cancellation = self._run(self._new_event())
         return self._run(self.backend.count_tokens(model, text, cancellation))
 
@@ -194,6 +250,18 @@ class BackendBridge:
     def model_info(self) -> tuple[ModelInfo, ...]:
         with self._lock:
             return tuple(self._models.values())
+
+    def discovery_options(self) -> tuple[bool, ...]:
+        with self._lock:
+            return tuple(self._discovery_options)
+
+    def token_count_history(self) -> tuple[tuple[str, str | RequestMessage], ...]:
+        with self._lock:
+            return tuple(self._token_count_history)
+
+    def chat_history(self) -> tuple[ChatInvocation, ...]:
+        with self._lock:
+            return tuple(self._chat_history)
 
     def stream_chat(
         self,
@@ -226,7 +294,10 @@ class BackendBridge:
             temperature=raw_options.get("temperature"),
             tools=tools,
             tool_choice=raw_options.get("tool_choice"),
+            model_options=raw_options.get("model_options", {}),
         )
+        with self._lock:
+            self._chat_history.append(ChatInvocation(model_id, messages, options))
 
         iterator = self.backend.stream_chat(
             model, messages, options, cancellation
@@ -371,6 +442,15 @@ class FileBridge:
 
     def model_info(self) -> tuple[ModelInfo, ...]:
         return self.backend.model_info()
+
+    def discovery_options(self) -> tuple[bool, ...]:
+        return self.backend.discovery_options()
+
+    def token_count_history(self) -> tuple[tuple[str, str | RequestMessage], ...]:
+        return self.backend.token_count_history()
+
+    def chat_history(self) -> tuple[ChatInvocation, ...]:
+        return self.backend.chat_history()
 
     def close(self) -> None:
         self._stopping.set()

@@ -35,6 +35,11 @@ class ImageContent:
 
 
 @dataclass(frozen=True)
+class JsonContent:
+    value: object
+
+
+@dataclass(frozen=True)
 class ToolCallContent:
     call_id: str
     name: str
@@ -44,11 +49,11 @@ class ToolCallContent:
 @dataclass(frozen=True)
 class ToolResultContent:
     call_id: str
-    content: str
+    content: str | Sequence[TextContent | ImageContent | JsonContent]
 
 
 ContentPart: TypeAlias = (
-    TextContent | ImageContent | ToolCallContent | ToolResultContent
+    TextContent | ImageContent | JsonContent | ToolCallContent | ToolResultContent
 )
 MessageRole: TypeAlias = Literal["system", "user", "assistant"]
 
@@ -72,7 +77,8 @@ class ChatOptions:
     max_output_tokens: int | None = None
     temperature: float | None = None
     tools: Sequence[ToolDefinition] = ()
-    tool_choice: str | None = None
+    tool_choice: str | int | None = None
+    model_options: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -90,10 +96,18 @@ class ResponseToolCall:
 @dataclass(frozen=True)
 class ResponseToolResult:
     call_id: str
-    content: str
+    content: str | Sequence[TextContent | ImageContent | JsonContent]
 
 
-ResponsePart: TypeAlias = ResponseText | ResponseToolCall | ResponseToolResult
+@dataclass(frozen=True)
+class ResponseData:
+    media_type: str
+    data: bytes
+
+
+ResponsePart: TypeAlias = (
+    ResponseText | ResponseToolCall | ResponseToolResult | ResponseData
+)
 
 
 class Backend(Protocol):

@@ -138,10 +138,13 @@ function serializeContentPart(part) {
   }
   if (part instanceof vscode.LanguageModelDataPart) {
     return {
-      type: "image",
+      type: "data",
       media_type: part.mimeType,
       data: Buffer.from(part.data).toString("base64"),
     };
+  }
+  if (part instanceof vscode.LanguageModelPromptTsxPart) {
+    return { type: "json", value: part.value };
   }
   if (part instanceof vscode.LanguageModelToolCallPart) {
     return {
@@ -155,23 +158,25 @@ function serializeContentPart(part) {
     return {
       type: "tool_result",
       call_id: part.callId,
-      content: part.content
-        .filter((item) => item instanceof vscode.LanguageModelTextPart)
-        .map((item) => item.value)
-        .join(""),
+      content: part.content.map(serializeContentPart),
     };
   }
-  return { type: "text", value: String(part) };
+  throw new Error(`Unsupported VS Code input content part: ${part?.constructor?.name}`);
+}
+
+function serializeRole(role) {
+  if (role === vscode.LanguageModelChatMessageRole.User) {
+    return "user";
+  }
+  if (role === vscode.LanguageModelChatMessageRole.Assistant) {
+    return "assistant";
+  }
+  throw new Error(`Unsupported VS Code chat-message role: ${role}`);
 }
 
 function serializeMessages(messages) {
   return messages.map((message) => ({
-    role:
-      message.role === vscode.LanguageModelChatMessageRole.User
-        ? "user"
-        : message.role === vscode.LanguageModelChatMessageRole.Assistant
-          ? "assistant"
-          : "system",
+    role: serializeRole(message.role),
     name: message.name,
     content: message.content.map(serializeContentPart),
   }));
@@ -202,6 +207,11 @@ function cancellationSignal(token, controller, onCancel) {
 }
 
 class HarnessProvider {
+  constructor() {
+    this.models = [];
+    this.lastReportedPartTypes = [];
+  }
+
   async provideLanguageModelChatInformation(options, token) {
     const controller = new AbortController();
     const listener = cancellationSignal(token, controller, async () => {});
@@ -211,7 +221,8 @@ class HarnessProvider {
         { silent: options.silent },
         controller.signal
       );
-      return result.models;
+      this.models = result.models;
+      return this.models;
     } finally {
       listener.dispose();
     }
@@ -236,8 +247,10 @@ class HarnessProvider {
           tool_choice: options.toolMode,
           max_output_tokens: options.modelOptions?.maxOutputTokens,
           temperature: options.modelOptions?.temperature,
+          model_options: options.modelOptions || {},
         },
       };
+      this.lastReportedPartTypes = [];
       const requestId = randomUUID();
       const requestPath = bridgePath(`request-${requestId}.json`);
       const temporaryPath = `${requestPath}.tmp`;
@@ -249,7 +262,7 @@ class HarnessProvider {
       await fs.promises.rename(temporaryPath, requestPath);
 
       for await (const part of readChatStream(chatId, controller.signal)) {
-        reportPart(part, progress);
+        this.lastReportedPartTypes.push(reportPart(part, progress));
       }
     } catch (error) {
       if (token.isCancellationRequested) {
@@ -275,10 +288,7 @@ class HarnessProvider {
             typeof text === "string"
               ? text
               : {
-                  role:
-                    text.role === vscode.LanguageModelChatMessageRole.User
-                      ? "user"
-                      : "assistant",
+                  role: serializeRole(text.role),
                   name: text.name,
                   content: text.content.map(serializeContentPart),
                 },
@@ -295,6 +305,7 @@ class HarnessProvider {
 function reportPart(part, progress) {
   if (part.type === "text") {
     progress.report(new vscode.LanguageModelTextPart(part.value));
+    return part.type;
   } else if (part.type === "tool_call") {
     progress.report(
       new vscode.LanguageModelToolCallPart(
@@ -303,20 +314,57 @@ function reportPart(part, progress) {
         part.arguments
       )
     );
+    return part.type;
   } else if (part.type === "tool_result") {
+    const content =
+      typeof part.content === "string"
+        ? [new vscode.LanguageModelTextPart(part.content)]
+        : part.content.map((item) => {
+            if (item.type === "text") {
+              return new vscode.LanguageModelTextPart(item.value);
+            }
+            if (item.type === "image" || item.type === "data") {
+              return new vscode.LanguageModelDataPart(
+                Buffer.from(item.data, "base64"),
+                item.media_type
+              );
+            }
+            if (item.type === "json") {
+              return new vscode.LanguageModelPromptTsxPart(item.value);
+            }
+            throw new Error(
+              `Unsupported backend tool-result content part: ${item.type}`
+            );
+          });
     progress.report(
-      new vscode.LanguageModelToolResultPart(part.call_id, [
-        new vscode.LanguageModelTextPart(part.content),
-      ])
+      new vscode.LanguageModelToolResultPart(part.call_id, content)
     );
+    return part.type;
+  } else if (part.type === "data") {
+    progress.report(
+      new vscode.LanguageModelDataPart(
+        Buffer.from(part.data, "base64"),
+        part.media_type
+      )
+    );
+    return part.type;
   } else {
     throw new Error(`Unsupported backend response part: ${part.type}`);
   }
 }
 
 function activate(context) {
+  const provider = new HarnessProvider();
   context.subscriptions.push(
-    vscode.lm.registerLanguageModelChatProvider(vendor, new HarnessProvider())
+    vscode.lm.registerLanguageModelChatProvider(vendor, provider),
+    vscode.commands.registerCommand(
+      "_pytestHarness.getModelInformation",
+      () => provider.models
+    ),
+    vscode.commands.registerCommand(
+      "_pytestHarness.getLastReportedPartTypes",
+      () => provider.lastReportedPartTypes
+    )
   );
 }
 
